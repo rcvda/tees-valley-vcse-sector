@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this dataset, please cite it as below."
+title: "Tees Valley VCSE Sector Size (based-in) - a weekly time series"
+abstract: "A living, weekly-updated time series of registered VCSE organisations based in each Tees Valley local authority (charities, CIOs, CICs, registered societies and CASCs), built from Find That Charity using the registered-office (based-in) rule."
+type: dataset
+authors:
+  - family-names: "Neal"
+    given-names: "Peter"
+    orcid: "https://orcid.org/0009-0005-8101-5785"
+    affiliation: "Redcar and Cleveland Voluntary Development Agency (RCVDA)"
+repository-code: "https://github.com/rcvda/tees-valley-vcse-sector"
+license: CC-BY-NC-SA-4.0
+keywords:
+  - "VCSE sector"
+  - "Tees Valley"
+  - "charities"
+  - "open data"
