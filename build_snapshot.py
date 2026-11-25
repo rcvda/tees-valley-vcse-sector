@@ -13,14 +13,28 @@ re-fetched when it is new or the CSV says its record changed (dateModified
 advanced). After the cache is seeded a weekly run is five CSV downloads plus a
 handful of lookups.
 
+Preserve by default (DATA-STANDARD §2-3): nothing fetched is discarded.
+
 Outputs each run:
-  data/snapshots/<YYYY-MM-DD>/<Borough>.csv   based-in VCSE orgs that week
+  data/snapshots/<YYYY-MM-DD>/raw/<LA code>-<Borough>.csv.gz
+                                              the five FTC location exports, byte-for-byte
+                                              as downloaded (unfiltered: every org FTC returns)
+  data/snapshots/<YYYY-MM-DD>/records.jsonl.gz
+                                              the full FTC org record (orgid JSON) for every
+                                              based-in VCSE org that week — address, finances,
+                                              employees, volunteers, trustees, links, etc.
+  data/snapshots/<YYYY-MM-DD>/<Borough>.csv   based-in VCSE orgs that week: the 10 legacy
+                                              columns, then EVERY other column of the FTC
+                                              export, then the scalar record fields
+                                              (RECORD_FIELDS), then borough / laCode / hqGeoCode
   data/tees-valley-vcse-timeseries.csv        the living spine — counts (appended, deduped)
   data/tees-valley-vcse-aggregates.json       the living detail — per-snapshot analytics
   data/cache/hq_geocodes.json                 HQ-geocode cache (committed)
+  data/cache/org_records.jsonl.gz             full-record cache; a record is re-fetched when
+                                              FTC's dateModified for it changes (committed)
 """
 from __future__ import annotations
-import ast, csv, io, json, os, datetime, time, statistics
+import ast, csv, gzip, io, json, os, datetime, time, statistics
 from collections import Counter
 from pathlib import Path
 import requests
@@ -61,9 +75,15 @@ SNAP_DIR = HERE/"data"/"snapshots"
 TIMESERIES = HERE/"data"/"tees-valley-vcse-timeseries.csv"
 AGGREGATES = HERE/"data"/"tees-valley-vcse-aggregates.json"
 CACHE = HERE/"data"/"cache"/"hq_geocodes.json"
+RECORDS = HERE/"data"/"cache"/"org_records.jsonl.gz"
 TS_HEADER = ["segment","borough","snapshot_date","definition","active","total","n_sources"]
 SNAP_HEADER = ["id","name","charityNumber","companyNumber","postalCode","segment",
-               "active","dateRegistered","dateRemoved","latestIncome"]
+               "active","dateRegistered","dateRemoved","latestIncome"]   # legacy order kept
+# scalar fields lifted from the full org record into the per-org CSV (the whole
+# record is also kept, unflattened, in records.jsonl.gz)
+RECORD_FIELDS = ["latestFinancialYearEnd","latestSpending","latestEmployees",
+                 "latestVolunteers","trusteeCount","description","telephone","email"]
+DERIVED = ["borough","laCode","hqGeoCode"]
 SNAPSHOT_DATE = os.environ.get("SNAPSHOT_DATE") or datetime.date.today().isoformat()
 
 def slugs(r):
@@ -95,7 +115,9 @@ def decade_of(r):
 def fetch_csv(code, session):
     r = session.get(FTC+"/", params={"q":"","location":code,"filetype":"csv"}, timeout=120)
     r.raise_for_status()
-    return list(csv.DictReader(io.StringIO(r.content.decode("utf-8-sig"))))
+    rows = list(csv.DictReader(io.StringIO(r.content.decode("utf-8-sig"))))
+    header = next(csv.reader(io.StringIO(r.content.decode("utf-8-sig"))), [])
+    return rows, header, r.content
 
 def hq_of(data):
     for l in (data.get("location") or []):
@@ -109,12 +131,30 @@ def load_cache():
         except Exception: return {}
     return {}
 
-def refresh_hq(vcse_rows, cache, session):
-    """Fetch HQ geocode for ids that are new or whose record changed."""
+def load_records():
+    out = {}
+    if RECORDS.exists():
+        try:
+            with gzip.open(RECORDS, "rt", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.strip():
+                        d = json.loads(line); out[d["id"]] = d
+        except Exception: return {}
+    return out
+
+def save_records(records):
+    with gzip.open(RECORDS, "wt", encoding="utf-8", compresslevel=9) as fh:
+        for oid in sorted(records):
+            fh.write(json.dumps(records[oid], ensure_ascii=False, sort_keys=True)+"\n")
+
+def refresh_hq(vcse_rows, cache, session, records):
+    """Fetch the full org record for ids that are new, whose record changed, or
+    whose full record is not yet held. Keeps the WHOLE record (records) and the
+    HQ geocode (cache)."""
     need = []
     for r in vcse_rows:
         rec = cache.get(r["id"]); dm = r.get("dateModified","")
-        if rec is None or rec.get("dm","") != dm:
+        if rec is None or rec.get("dm","") != dm or r["id"] not in records:
             need.append((r["id"], dm))
     fetched = 0
     for oid, dm in need:
@@ -124,12 +164,14 @@ def refresh_hq(vcse_rows, cache, session):
                 cache[oid] = {"geoCode":"","dm":dm,"missing":True}
             else:
                 resp.raise_for_status()
-                cache[oid] = {"geoCode":hq_of(resp.json()),"dm":dm}
+                data = resp.json()
+                records[oid] = data
+                cache[oid] = {"geoCode":hq_of(data),"dm":dm}
             fetched += 1
         except Exception as e:
             if oid not in cache:            # keep any prior value on transient error
                 cache[oid] = {"geoCode":"","dm":dm,"error":str(e)[:60]}
-        time.sleep(0.3)
+        time.sleep(0.15)
     return fetched
 
 def compute_rich(rows):
@@ -176,6 +218,16 @@ def compute_rich(rows):
         size[k]["pct"] = round(100*size[k]["val"]/sv) if sv else 0
         size[k]["val"] = round(size[k]["val"])
     o["size"] = size
+    def num(v):
+        try: return float(v) if v not in (None,"") else None
+        except Exception: return None
+    wf = {}
+    for f, k in (("latestEmployees","employees"),("latestVolunteers","volunteers"),
+                 ("trusteeCount","trustees"),("latestSpending","spending")):
+        vals = [num((r.get("_rec") or {}).get(f)) for r in active]
+        vals = [v for v in vals if v is not None]
+        wf[k] = round(sum(vals)); wf[k+"_n"] = len(vals)
+    o["workforce"] = wf
     o["has_web"] = sum(1 for r in active if (r.get("url") or "").strip())
     o["web_pct"] = round(100*o["has_web"]/len(active), 1) if active else 0
     top = sorted(active, key=lambda r: (income_of(r) or -1), reverse=True)[:10]
@@ -191,16 +243,28 @@ def main():
     SNAP_DIR.mkdir(parents=True, exist_ok=True)
     CACHE.parent.mkdir(parents=True, exist_ok=True)
     cache = load_cache()
+    records = load_records()
     summary = []
     based = {name: [] for name in BOROUGH_NAMES}   # annotated based-in VCSE rows per borough
     with requests.Session() as s:
-        csvs = {code: fetch_csv(code, s) for code,_ in BOROUGHS}
+        fetched_csv = {code: fetch_csv(code, s) for code,_ in BOROUGHS}
+        csvs = {code: v[0] for code, v in fetched_csv.items()}
+        outdir = SNAP_DIR/SNAPSHOT_DATE; (outdir/"raw").mkdir(parents=True, exist_ok=True)
+        ftc_cols = []
+        for code, name in BOROUGHS:
+            with open(outdir/"raw"/f"{code}-{name}.csv.gz", "wb") as fh:
+                fh.write(gzip.compress(fetched_csv[code][2], mtime=0))
+            for c in fetched_csv[code][1]:
+                if c not in ftc_cols: ftc_cols.append(c)
+        extra_cols = [c for c in ftc_cols if c not in SNAP_HEADER]
+        header = SNAP_HEADER + extra_cols + RECORD_FIELDS + DERIVED
         vcse_all = {}
         for rows in csvs.values():
             for r in rows:
                 if is_vcse(r): vcse_all[r["id"]] = r
-        fetched = refresh_hq(list(vcse_all.values()), cache, s)
-        print(f"hq cache: {len(cache)} entries ({fetched} fetched this run)")
+        fetched = refresh_hq(list(vcse_all.values()), cache, s, records)
+        print(f"hq cache: {len(cache)} entries; full records held: {len(records)} ({fetched} fetched this run)")
+        week_records = []
         for code, name in BOROUGHS:
             act, tot, snap = Counter(), Counter(), []
             for r in csvs[code]:
@@ -209,20 +273,30 @@ def main():
                 if not rec or rec.get("geoCode") != code: continue
                 seg = segment(slugs(r))
                 r["_seg"] = seg; r["_la"] = name
+                full = records.get(r["id"]) or {}
+                r["_rec"] = full
+                if full: week_records.append(full)
                 based[name].append(r)
                 tot[seg]+=1; active = 1 if r["active"]=="True" else 0
                 if active: act[seg]+=1
                 snap.append([r["id"], r["name"], r["charityNumber"], r["companyNumber"],
                              r["postalCode"], seg, active, r["dateRegistered"],
-                             r["dateRemoved"], r["latestIncome"]])
-            outdir = SNAP_DIR/SNAPSHOT_DATE; outdir.mkdir(parents=True, exist_ok=True)
+                             r["dateRemoved"], r["latestIncome"]]
+                            + [r.get(c,"") for c in extra_cols]
+                            + [("" if full.get(f) is None else full.get(f)) for f in RECORD_FIELDS]
+                            + [name, code, rec.get("geoCode","")])
             with open(outdir/(name+".csv"), "w", newline="", encoding="utf-8") as fh:
-                w=csv.writer(fh); w.writerow(SNAP_HEADER); w.writerows(snap)
+                w=csv.writer(fh); w.writerow(header); w.writerows(snap)
             for seg in SEGMENTS:
                 summary.append([seg, name, SNAPSHOT_DATE, "based-in", act[seg], tot[seg], 1])
             print(f"  {name}: active {sum(act[seg] for seg in SEGMENTS)}  (" +
                   ", ".join(f"{seg} {act[seg]}/{tot[seg]}" for seg in SEGMENTS) + ")")
+        with gzip.open(outdir/"records.jsonl.gz", "wt", encoding="utf-8", compresslevel=9) as fh:
+            for d in sorted(week_records, key=lambda d: d.get("id","")):
+                fh.write(json.dumps(d, ensure_ascii=False, sort_keys=True)+"\n")
+        print(f"records: {len(week_records)} full org records written for {SNAPSHOT_DATE}")
     CACHE.write_text(json.dumps(cache, separators=(',',':'), sort_keys=True))
+    save_records(records)
 
     # append to timeseries (counts spine), dedup on (segment,borough,date)
     existing = []
