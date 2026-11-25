@@ -154,8 +154,8 @@ def compute_rich(rows):
         "charitable_company": sum(1 for r in char if "registered-company" in slugs(r) and not (slugs(r)&CIO)),
         "trust": sum(1 for r in char if "trust" in slugs(r)),
     }
-    dc = Counter(decade_of(r) for r in active if decade_of(r))
-    o["decades"] = {k: dc.get(k,0) for k in DECADES}
+    dc = Counter((decade_of(r), r["_seg"]) for r in active if decade_of(r))
+    o["decades"] = {k: {s: dc.get((k,s),0) for s in SEGMENTS} for k in DECADES}
     incomes = [income_of(r) for r in active]
     have = [v for v in incomes if v is not None]
     o["no_income"] = sum(1 for v in incomes if v is None)
