@@ -156,22 +156,38 @@ def refresh_hq(vcse_rows, cache, session, records):
         rec = cache.get(r["id"]); dm = r.get("dateModified","")
         if rec is None or rec.get("dm","") != dm or r["id"] not in records:
             need.append((r["id"], dm))
-    fetched = 0
-    for oid, dm in need:
-        try:
-            resp = session.get(f"{FTC}/orgid/{oid}.json", timeout=15)
-            if resp.status_code == 404:
-                cache[oid] = {"geoCode":"","dm":dm,"missing":True}
-            else:
-                resp.raise_for_status()
-                data = resp.json()
-                records[oid] = data
-                cache[oid] = {"geoCode":hq_of(data),"dm":dm}
-            fetched += 1
-        except Exception as e:
-            if oid not in cache:            # keep any prior value on transient error
-                cache[oid] = {"geoCode":"","dm":dm,"error":str(e)[:60]}
-        time.sleep(0.15)
+    fetched, failed = 0, {}
+    def one(oid, dm):
+        resp = session.get(f"{FTC}/orgid/{oid}.json", timeout=30)
+        if resp.status_code == 404:
+            cache[oid] = {"geoCode":"","dm":dm,"missing":True}; return
+        resp.raise_for_status()
+        data = resp.json()
+        records[oid] = data
+        cache[oid] = {"geoCode":hq_of(data),"dm":dm}
+    # first pass, then up to two retry passes with back-off, for transient errors
+    todo = list(need)
+    for attempt in range(3):
+        if attempt: time.sleep(10*attempt)
+        nxt = []
+        for oid, dm in todo:
+            try:
+                one(oid, dm); fetched += 1; failed.pop(oid, None)
+            except Exception as e:
+                failed[oid] = f"{type(e).__name__}: {str(e)[:120]}"
+                nxt.append((oid, dm))
+            time.sleep(0.15)
+        todo = nxt
+        if not todo: break
+    for oid, err in failed.items():
+        if oid in cache:                    # keep the prior geocode, but record the failure
+            cache[oid]["error"] = err[:60]
+        else:
+            cache[oid] = {"geoCode":"","dm":"","error":err[:60]}   # dm blank -> retried next run
+    refresh_hq.failed = failed
+    if failed:
+        print(f"WARNING: {len(failed)} org record(s) could not be fetched after 3 attempts:")
+        for oid, err in sorted(failed.items()): print(f"  {oid}  {err}")
     return fetched
 
 def compute_rich(rows):
@@ -228,6 +244,18 @@ def compute_rich(rows):
         vals = [v for v in vals if v is not None]
         wf[k] = round(sum(vals)); wf[k+"_n"] = len(vals)
     o["workforce"] = wf
+    # social enterprise types: CICs, and registered societies by sub-type (first match wins)
+    SOC_TYPES = [("community-benefit-society","community_benefit"),("co-operative-society","co_operative"),
+                 ("credit-union","credit_union"),("working-mens-club","working_mens_club"),
+                 ("friendly-society","friendly_society")]
+    st = {k: 0 for _, k in SOC_TYPES}; st["other"] = 0
+    for r in active:
+        if r["_seg"] != "Societies": continue
+        t = slugs(r)
+        for slug, k in SOC_TYPES:
+            if slug in t: st[k] += 1; break
+        else: st["other"] += 1
+    o["social_enterprise"] = {"cic": sum(1 for r in active if r["_seg"] == "CICs"), "society_types": st}
     o["has_web"] = sum(1 for r in active if (r.get("url") or "").strip())
     o["web_pct"] = round(100*o["has_web"]/len(active), 1) if active else 0
     top = sorted(active, key=lambda r: (income_of(r) or -1), reverse=True)[:10]
@@ -295,6 +323,16 @@ def main():
             for d in sorted(week_records, key=lambda d: d.get("id","")):
                 fh.write(json.dumps(d, ensure_ascii=False, sort_keys=True)+"\n")
         print(f"records: {len(week_records)} full org records written for {SNAPSHOT_DATE}")
+        based_ids = [r["id"] for name in BOROUGH_NAMES for r in based[name]]
+        no_record = sorted(i for i in based_ids if i not in records)
+        (outdir/"fetch-report.json").write_text(json.dumps({
+            "snapshot": SNAPSHOT_DATE,
+            "based_in_orgs": len(based_ids),
+            "full_records_written": len(week_records),
+            "orgs_without_full_record": no_record,
+            "fetch_errors_this_run": getattr(refresh_hq, "failed", {}),
+        }, indent=1, ensure_ascii=False))
+        if no_record: print(f"WARNING: {len(no_record)} based-in org(s) have no full record this week (see fetch-report.json)")
     CACHE.write_text(json.dumps(cache, separators=(',',':'), sort_keys=True))
     save_records(records)
 

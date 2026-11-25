@@ -36,6 +36,9 @@ Nothing fetched is discarded (RCVDA `DATA-STANDARD.md` §2-3, preserve by defaul
 - `data/tees-valley-vcse-aggregates.json` - per-snapshot summary analytics for the
   dashboard (a summary only; the full data is in the files above), now including
   `workforce` (employees, volunteers, trustees, spending and the number reporting each).
+- `data/snapshots/<date>/fetch-report.json` - completeness check for that week: based-in
+  organisations, full records written, any organisation without a full record, and any
+  fetch errors (each record fetch is tried up to three times).
 - `data/cache/org_records.jsonl.gz` - full-record cache; a record is re-fetched when FTC's
   `dateModified` for it changes.
 
