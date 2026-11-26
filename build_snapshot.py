@@ -69,6 +69,18 @@ BANDS = [("£1m +",1_000_000),("£500k - £1m",500_000),("£250k - £500k",250_0
          ("£100k - £250k",100_000),("£75k - £100k",75_000),("£50k - £75k",50_000),
          ("Over 25k",25_000),("Over 10k",10_000),("Under 10k",0)]
 DECADES = ["2020s","2010s","2000s","1990s","1980s","1970s","1960s","Pre-1960"]
+# ONS UK Business Counts turnover size bands (Nomis NM_199_1), lower bounds in £,
+# lowest first — so the charities can be set against the Tees Valley business base.
+ONS_TURNOVER_BANDS = [("£0–£49k",0),("£50k–£99k",50_000),("£100k–£249k",100_000),
+    ("£250k–£499k",250_000),("£500k–£999k",500_000),("£1m–£1.99m",1_000_000),
+    ("£2m–£4.99m",2_000_000),("£5m–£9.99m",5_000_000),("£10m–£49.99m",10_000_000),
+    ("£50m+",50_000_000)]
+def ons_band_counts(incomes):
+    """Counts of reported incomes in each ONS turnover band, lowest band first."""
+    c = [0]*len(ONS_TURNOVER_BANDS)
+    for v in incomes:
+        c[max(i for i,(_,lo) in enumerate(ONS_TURNOVER_BANDS) if v >= lo)] += 1
+    return c
 
 HERE = Path(__file__).resolve().parent
 SNAP_DIR = HERE/"data"/"snapshots"
@@ -219,6 +231,7 @@ def compute_rich(rows):
     o["no_income"] = sum(1 for v in incomes if v is None)
     o["income_bands"] = {lab: 0 for lab,_ in BANDS}
     for v in have: o["income_bands"][band_of(v)] += 1
+    o["income_bands_ons"] = ons_band_counts(have)
     o["avg_income"] = round(sum(have)/len(have)) if have else 0
     o["median_income"] = round(statistics.median(have)) if have else 0
     sv = sum(have)
